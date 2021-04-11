@@ -1,0 +1,55 @@
+
+test1:     file format elf64-x86-64
+
+Contents of the .eh_frame section:
+
+00000000 00000014 00000000 CIE
+  Version:               1
+  Augmentation:          "zR"
+  Code alignment factor: 1
+  Data alignment factor: -8
+  Return address column: 16
+  Augmentation data:     1b
+
+  DW_CFA_def_cfa: r7 (rsp) ofs 8
+  DW_CFA_offset: r16 (rip) at cfa-8
+  DW_CFA_nop
+  DW_CFA_nop
+
+00000018 00000014 0000001c FDE cie=00000000 pc=fffffffffffffed4..fffffffffffffeda
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+
+00000030 00000014 00000034 FDE cie=00000000 pc=fffffffffffffee0..fffffffffffffee2
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+
+00000048 00000024 0000004c FDE cie=00000000 pc=fffffffffffffef0..ffffffffffffff79
+  DW_CFA_advance_loc: 17 to ffffffffffffff01
+  DW_CFA_offset: r12 (r12) at cfa-40
+  DW_CFA_offset: r6 (rbp) at cfa-48
+  DW_CFA_advance_loc: 31 to ffffffffffffff20
+  DW_CFA_def_cfa_offset: 64
+  DW_CFA_offset: r3 (rbx) at cfa-56
+  DW_CFA_offset: r15 (r15) at cfa-16
+  DW_CFA_offset: r14 (r14) at cfa-24
+  DW_CFA_offset: r13 (r13) at cfa-32
+  DW_CFA_advance_loc1: 88 to ffffffffffffff78
+  DW_CFA_def_cfa_offset: 8
+  DW_CFA_nop
+  DW_CFA_nop
+  DW_CFA_nop
+
+00000070 ZERO terminator
+
+
