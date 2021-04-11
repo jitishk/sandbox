@@ -1,0 +1,108 @@
+nfp_exporter_info_t
+    == netflow_sensor_cfg_gen  // Configure analytics/netflow modes
+        -> tah_sdk_hea_fta_cfg_general_t
+        -> tah_sdk_hea_fta_cfg_export_to_cpu_t
+        -> tah_sdk_hea_fta_cfg_l3_length_mode_t 
+        -> tah_sdk_hea_fta_cfg_latency_mode_t 
+        == tah_sdk_hea_fta_cfg_ptp_clock_control_t
+        -> tah_sdk_hea_lud_cfg_global_t
+        == tah_sdk_hea_lud_cfg_ft_oport_t
+        == tah_sdk_hea_lud_cfg_flowtbl_src_tep_resolution_t
+        == tah_sdk_hea_fta_cfg_fabric_link_t
+        == tah_sdk_hea_prx_cfg_ft_latency_t
+    -> netflow_sensor_collector_bkt_tbl
+        <> tah_sdk_hea_fta_collectoridx_t
+        <> tah_sdk_hea_fta_cfg_flow_hash_t
+    -> netflow_sensor_ftable_pkt_hdr_t
+        <> tah_sdk_hea_fta_ftpkthdr_t
+    -> {}
+        -> tah_l3_intf_t
+
+NFM: record & exporter
+nfp_cfg_entry_t
+    -> netflow_sensor_ce_mask_entry
+        <> tah_sdk_hea_fta_cfg_ce_t
+        -> tah_sdk_hea_fta_cfg_flow_mask_ctrl_ce_t
+    -> netflow_sensor_ipv4_mask_entry
+        <> tah_sdk_hea_fta_cfg_ipv4_t
+        -> tah_sdk_hea_fta_cfg_flow_mask_ctrl_ipv4_t 
+    -> netflow_sensor_ipv6_mask_entry
+        <> tah_sdk_hea_fta_cfg_ipv6_t
+        -> tah_sdk_hea_fta_cfg_flow_mask_ctrl_ipv6_t
+
+ 
+nfm_hw_info_t {nfm_hw_cfg_t, nfm_hw_profile_t}
+    -> netflow_sensor_cfg_global
+        <- tah_sdk_hea_fta_cfg_glb_t
+        <- tah_sdk_hea_fta_cfg_latency_mode_t
+        <- tah_sdk_hea_fta_cfg_general_t 
+    -> netflow_sensor_tcp_hdr_len_bin
+        <> tah_sdk_hea_fta_cfg_tcp_opt_len_t
+    -> netflow_sensor_pyld_length_bin
+        <> tah_sdk_hea_fta_cfg_pyld_len_t
+    -> netflow_sensor_rcv_win_threshold
+        <> tah_sdk_hea_fta_cfg_rcv_win_t
+    -> netflow_sensor_seq_num_guess_threshold
+        <> tah_sdk_hea_fta_cfg_seq_t
+
+{print}
+    <- netflow_sensor_debug_counter    // where is insert counter?
+        <- tah_sdk_hea_fta_cnt_flow_hit_ipv4_t
+        <- tah_sdk_hea_fta_cnt_flow_hit_ipv6_t
+        <- tah_sdk_hea_fta_cnt_flow_hit_ce_t
+        <- tah_sdk_hea_fta_cnt_flow_create_ipv6_t
+        <- tah_sdk_hea_fta_cnt_flow_create_ipv4_t
+        <- tah_sdk_hea_fta_cnt_flow_create_ce_t
+        <- tah_sdk_hea_fta_cnt_export_t
+        <- tah_sdk_hea_fta_cnt_skip_collect_t
+        <- tah_sdk_hea_fta_cnt_luft_t
+    <- netflow_sensor_export_debug
+        <- tah_sdk_hea_fta_cfg_export_dbg_t
+    <- netflow_sensor_export_params
+        <> tah_sdk_hea_fta_cfg_exp_t
+    <- netflow_sensor_export_hdr
+        <> tah_sdk_hea_fta_cfg_export_hdr_t
+    <- netflow_sensor_flow_hash
+        <> tah_sdk_hea_fta_cfg_flow_hash_t
+    <- netflow_sensor_flow_records
+        <- tah_sdk_hea_ftb_fttile_t
+
+{}
+    ?? netflow_sensor_analysis 
+        // doesn't seem to be used
+        <- tah_sdk_hea_ftb_fttile_t
+    ?? netflow_sensor_cfg_fifo
+        <> tah_sdk_hea_fta_cfg_fifo_t
+    ?? netflow_sensor_higig_hdr
+        <> tah_sdk_hea_fta_cfg_higig_hdr_t
+    ?? netflow_sensor_export_hash
+        <> tah_sdk_hea_fta_cfg_export_hash_t
+    <- netflow_sensor_field (used to demux commands @ libdrv (need to confirm))
+        == tah_sdk_hea_fta_cfg_num_active_collector_sets_t
+        == tah_sdk_hea_fta_cfg_exp_t
+        == tah_sdk_hea_fta_cfg_export_hdr_t
+        == tah_sdk_hea_fta_collectoridx_t
+        == tah_sdk_hea_fta_cfg_flow_hash_t
+    -> netflow_sensor_ftb_cfg_mem_init 
+        // used to reset flow records (nfp_reset_flow_records()). Called before writing netflow_sensor_ftcam_entry
+        <> tah_sdk_hea_ftb_cfg_disable_mem_init_t
+    ?? netflow_sensor_lfsr
+        <> tah_sdk_hea_fta_cfg_lfsr_t
+    ?? netflow_sensor_ptp_clock_ctrl
+        <> tah_sdk_hea_fta_cfg_ptp_clock_control_t
+    ?? netflow_sensor_rtt_sampling_shift
+        <> tah_sdk_hea_fta_cfg_rtt_sampling_shift_t
+    ?? netflow_sensor_tbl_size
+        <- TAH_SDK_HEA_FTA_FTPKTHDR_MAX_ENTRIES/TAH_SDK_HEA_FTA_CFG_CE_NUM_MASK/...
+
+
+{disable/enable analytics/aclqos-nfp disable}
+    -> netflow_sensor_port_control
+        <> tah_sdk_hea_fta_cfg_port_control_t
+
+aclqos_tah_vmr_list_entry_t(aclqos),{}(nfp:commented out)
+    <> netflow_sensor_ftcam_entry{netflow_sensor_ftcam_data_t}
+        <> tah_sdk_hom_fta_filtertcam_t
+
+
+

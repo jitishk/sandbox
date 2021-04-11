@@ -1,0 +1,67 @@
+
+
+
+Notes for NFP-SDK interface:
+
+-   Can we rewrite tah_sdk_<plat>_netflow_sensor.c to using a more consolidated interface? Should they be moved under HAL?
+-   index to read_tah_sdk_hea_ftb_fttile() seems to be per entry (i.e. 0-64k)
+-   Is ipv4/ipv6 records always stored in FULL mode?
+-   whatis ftcam_data.analytics_valid bit in netflow_sensor_ftcam_entry
+
+UT Coverage:
+- reload
+- process restart
+- switch-over (ISSU)
+- config/no config
+    - config replace
+    - checkpoints
+    - ascii
+
+Coding Guidelines:
+- consistent debug and trace logs (no separate buginf_wrap etc..)
+    - fix broad categories for debug/traces (DB_NF_ERROR, DBG_RTP_ etc...)
+    - check binary logging
+    - separate based on high/low freq trace generation?
+
+
+ASIC Details
+    4k Rows * 4 Banks per slice
+    Each bank can store 4 condensed ipv4, or 2 full ipv4, or 1 ipv6.
+    (Max capacity = 4k * 4 * 4 = 64K condensed ipv4)
+    Reads/Write entire 4 banks at a time. i.e. each row corresponds to one hash-value
+    Update Cycle, has a pipline of 20 cyles (i.e. 20 hash values)
+    Exporter Cycle, blocks if the row its processing is in the Update cycle's pipeline.
+    Update Cycle:
+        - compute update-hash (12 bits = 4K) for incomming flow. (range: 0-4k)
+        - read row for all 4 banks at once
+            - search row for flow. also search overflow tcam for flow.
+                - if found, update entry
+                - if not found, increment "create" counter. try to insert. 
+                    - if both row and overflow tcam are full, drop
+                    - if row is full and overflow tcam has space, insert in overflow-tcam. 
+                        - increment "insert" counter. 
+                        - set valid bit.
+                    - if row has space, insert and increment "insert" couter
+                        - increment "insert" counter. 
+                        - set valid bit.
+        |_ go to next row
+
+    Export Cycle:
+        - for each collector:
+            - for each row.
+                - if row index is in Update Cycle Pipeline. Block
+                - if row index ins not in Update Cycle Pipeline, read all entries and compute their export-hash (16 bits = 64K?) value.
+                    - if export-hash values matches that of collector
+                        - send entry to FTPacket FIFO.
+                        - reset valid bit in bank.
+            |_ go to next row
+        |_ go to next collector
+
+questions:
+    interlace wr/read
+    index overflow? A: not indexed
+    how long has there been and entry in a row
+    wait for read-lock? how long?
+    in FT packet hash_collsion flow_hash_idx.
+
+

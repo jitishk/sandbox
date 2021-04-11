@@ -1,0 +1,755 @@
+#!/bin/bash
+#
+# Script for starting gdb with proper library path
+# 
+# The script can be used on target or LDS machine. 
+# 
+# The script can be used for debugging running prgoram
+# or get info from core dumps.
+#
+# Use "xrng_gdb -h" to get help on possible commands
+
+
+rootdir="???"
+smudir="???"
+program="???"
+use_crash_tool="???"
+progarch=
+lib64=64
+corefile=""
+boardtype="rp"
+treetype="???"
+platform="panini" #Only valid for XR
+spirit="-spirit" #Used for libdir, Piref does not have this
+bcmtype=""
+bcmpath=""
+gdboptions=()
+
+TMPDIR=$(mktemp -d /tmp/xrng_gdb.XXXXXX)
+echo "Tmpdir $TMPDIR"
+
+unamestr=`uname`
+if [[ "$unamestr" != "Linux" ]]; then
+   echo "$(basename $0) need to run on Linux" 
+   exit
+fi
+
+#trap "rm -fr ${TMPDIR}/;" EXIT
+
+#
+# generic error
+#
+error () {
+    echo "***ERROR: $@" >&2
+    exit 1
+}
+
+#returns OK if $1 contains $2
+strstr() {
+  [ "${1#*$2*}" = "$1" ] && return 1
+  return 0
+}
+
+
+set_xr_board_type () {
+    local btype=$1
+    if [[ $btype == "lc" ]]; then
+        echo -n "lc"
+    else
+        if [[ $btype == "rplc" ]]; then
+            echo -n "rplc"
+        else
+          echo -n "rp"
+        fi
+    fi
+}
+
+adjust_bcmpath() {
+    # use -pp if fretta/ncs5500
+    if [ $platform = 'fretta' ]; then
+        bcmtype="-pp"
+    fi
+    if [ $platform = 'ncs5500' ]; then
+        bcmtype="-pp"
+    fi
+
+    local fabricdir=thirdparty/broadcom${bcmtype}/fabric
+    local fabricbld=${fabricdir}/sources/bcmsdk/build/unix-user
+    local fabriclib=${fabricdir}/sdk/${progarch}/usr/lib$lib64
+    
+    if [ -d "${bcmpath}/${fabricbld}/fretta-lc_${progarch}-2_6" ]; then
+	bcmpath="${bcmpath}/${fabricbld}/fretta-lc_${progarch}-2_6"
+    elif [ -d "${bcmpath}" ]; then
+	:
+    elif [ -f ${rootdir}/${fabriclib}/libbcm.so.6.0.0.sym ]; then
+        bcmpath=${TMPDIR}/bcmsdk-syms
+        mkdir ${bcmpath}
+        ln -s ${rootdir}/${fabriclib}/*.sym ${bcmpath}/
+        for i in ${bcmpath}/*.6.0.0.sym; do
+	    ln -sf $(basename ${i%.sym}) ${i%.6.0.0.sym}
+        done
+        for i in ${bcmpath}/*.sym; do
+	    mv ${i} ${i%.sym}
+        done
+    elif [ -d "$rootdir/${fabriclib}" ]; then
+        bcmpath=$rootdir/${fabriclib}
+    fi
+}
+
+readjust_xr_platform_type () {
+    # If default platform does not have directory readjust
+    # based on img-DIR
+    if [ ! -d $rootdir/img-$platform ]; then
+      # looking for the newest image to set platform
+      imgnum=$(ls -lt $rootdir/img-*/*.iso | wc -l)
+      if [ $imgnum -gt 0 ]; then
+        line=$(ls -1t $rootdir/img-*/*.iso | head -n 1)
+        path=${line%/*}
+        platform=${path##*-}
+      else
+        echo "no *.iso image found in the workspace."
+      fi
+      if [ platform == "piref" ]; then
+        spirit=""
+      fi
+    fi
+}
+
+set_xr_platform_type () {
+    local ptype=$1
+    echo -n "$ptype"
+}
+
+find_smu_basedir () {
+    local path=$1
+    local saved=$path
+
+    # try and help people who do "-r ."
+    if [[ $path == "." ]]; then
+        path=$(pwd)
+    fi
+
+    # sanity count to bail out without searching all of cisco
+    local count=0
+    while ! [[ -d "$path/sym" ]]; do
+        path=`dirname $path`
+        count=$(($count+1))
+        if [[ $count -gt 10 ]]; then
+            error "root dir $saved is not within a valid acme tree"
+        fi
+    done
+    echo -n $path
+}
+
+# Convert smu path seperated by ":" to proper SMULIBPATH
+# Convert foo:bar:test to 
+#  foo:sym/obj-img/lib/${boardtype}/obj-x86_64-linux${spirit}:\
+#  bar:sym/obj-img/lib/${boardtype}/obj-x86_64-linux${spirit}:\
+#  test:sym/obj-img/lib/${boardtype}/obj-x86_64-linux${spirit}:
+# 
+setup_smulib_path () {
+    SMULIBPATH=""
+    IFS=$':'
+    local paths=$1
+    local btype=$2
+    local sprt=$3
+    local smudir
+    for i in $paths; do
+        smudir=$(find_smu_basedir $i)
+        symfile=$(echo $smudir/sym/sym_files_*)
+        symlibdir=$smudir/sym/obj-img/lib
+        symdir=$smulibdir/${btype}/obj-x86_64-linux${sprt}
+        if [ -f "$symfile" ]; then
+            echo "== SMU Dir ===== $symfile"
+            syminstdir=${TMPDIR}/$(basename $i)
+            mkdir -p $syminstdir
+            (cat $symfile ; echo)| while read f; do
+                [ -z "$f" ] || ln -sf "$smudir/sym/$f" "$syminstdir/$(basename ${f%.sym})"
+            done
+            symdir=${syminstdir}
+        elif [ ! -d $symdir ]; then
+            if [ -d "$symlibdir" ]; then
+                echo "SMU $smudir does not contain symbols for $btype."
+                continue
+            else
+                error "No symbol dir $symdir found for $smudir"
+            fi
+        fi
+        if [ -n "$instances" ]; then
+          for inst in "${instances[@]}"; do
+            syminstdir=${TMPDIR}/$(basename $i)
+            grep -h /instances/${inst} ${rootdir}/img-*/*.spec 2>/dev/null | grep -v '%verify(user group)' | \
+		sed -e 's,\$(CNCOPY_WSROOT),'"${rootdir}"',g' \
+		    -e "s,\$RPM_BUILD_ROOT%{pkg_root}/[^/]*/instances/,$syminstdir/,g" \
+                    -e 's,\.so ,.so.sym ,g' \
+		    -e 's/^cp /ln -sf /'   \
+		    -e "s,${rootdir},$(find_smu_basedir $i)/sym," \
+		| bash
+            find $syminstdir -name \*.sym | while read f; do mv $f ${f%.sym}; done
+            symdir=${syminstdir}/${inst}/lib:${symdir}
+          done
+        fi
+        SMULIBPATH="${SMULIBPATH}$symdir:"
+    done
+    unset IFS
+}
+
+sanitize_smulib_path () {
+    local corefile=$1
+    local paths=$2
+    IFS=$':'
+    for i in $paths; do
+	local tmpdir=${TMPDIR}/${i##*/}
+	local DDTS=${tmpdir##*.}
+	if [ -d "$tmpdir" ]; then
+	    eu-readelf -n "$corefile" | grep /opt | grep -v ${DDTS} | sed 's,.*/,,' | uniq | (cd "$tmpdir" && xargs rm -f)
+        fi
+    done
+    unset IFS
+}
+
+setup_smulib_path_calvados () {
+    SMULIBPATH=""
+    IFS=$':'
+    local paths=$1
+    local smudir
+    for i in $paths; do
+        smudir=$(find_smu_basedir $i)
+        symdir=$smudir/sym/kvm-calvados-stage/$progarch/opt/cisco/calvados/usr/lib$lib64
+        if [ ! -d $symdir ]; then
+            error "No symbol dir $symdir found for $smudir"
+        fi
+        SMULIBPATH="${SMULIBPATH}$symdir:"
+    done
+    unset IFS
+}
+
+#
+# function to figure out the acme root dir given a path that belongs
+# within that root dir
+#
+find_acme_root () {
+    local path=$1
+    local saved=$path
+
+    # try and help people who do "-r ."
+    if [[ $path == "." ]]; then
+        path=$(pwd)
+    fi
+
+    # sanity count to bail out without searching all of cisco
+    local count=0
+    while ! [[ -d "$path/.ACMEROOT" ]]; do
+        path=`dirname $path`
+        count=$(($count+1))
+        if [[ $count -gt 10 ]]; then
+            error "root dir $saved is not within a valid acme tree"
+        fi
+    done
+    echo -n $path
+}
+
+
+find_tree_type () {
+    local path=$1
+    local progname=$2
+    local cnt
+    local result
+
+    cnt=`cat ${1}/.ACMEROOT/ws.lu | grep thirdparty | wc -l`
+    if [ "${cnt}" -gt "50" -a -d "${1}/kvm-host-stage/" ]; then
+        result="thirdparty"
+    else
+        cnt1=`cat ${1}/.ACMEROOT/ws.lu | grep platforms | wc -l` 
+        if [ "${cnt1}" -gt "1000" ]; then
+            result="xr"
+            if [ -d ${1}/calvados/build/make-lib ]; then
+                # Combined work space. Figure out whether program is 
+                # for calvados or XR. This is doing using path
+                # if path contains $(root)/calvados then it is calvados
+                local realprog1=$(readlink -f $progname)
+                local tmpdirname=`dirname $realprog1`
+                if strstr $tmpdirname "kvm-calvados-stage" ; then
+                    # xrng_gdb -p kvm-calvados-stage/<CALVADOS-PROG>
+                    result="calvados"
+                else 
+                    if strstr $tmpdirname "calvados" ; then
+                        # xrng_gdb -p calvados/<CALVADOS-PROG>
+                        result="calvados"
+                    fi
+                fi
+                # anything with "-x86_64-linux-spirit" would be from XR
+                # even though dirname or path has calvados in it
+                if strstr $tmpdirname "-x86_64-linux-spirit" ; then
+                    result="xr"
+                fi
+                # -x86_64-ms == enxr-spirit
+                if strstr $tmpdirname "-x86_64-ms" ; then
+                    result="xr"
+                fi
+            fi
+        else
+              result="calvados"
+        fi
+    fi
+    echo -n $result
+}
+
+find_program () {
+    local progname=$1
+    if [ -f $progname ]; then
+	echo -n $progname
+	return
+    elif [ x"/" != x"${progname:0:1}" ]; then
+	# Search SMU dirs/workspace root
+	local IFS=$':'
+	for i in $smudir; do
+	    i=$(find_smu_basedir $i)
+	    if [ -f "$i/sym/$progname" ]; then
+		echo -n "$i/sym/$progname"
+		return
+	    fi
+	done
+	if [ -f "$rootdir/$progname" ]; then
+	    echo -n "$rootdir/$progname"
+set +x
+	    return
+	fi
+    fi
+    error "cannot find $progname"
+}
+
+
+#
+# verify that required programs/environment are available and work
+#
+verify_env () {
+    local rv=0
+
+    $GDB -h >/dev/null 2>&1
+    rv=$(($rv+$?))
+    $FILE_PROG --help >/dev/null 2>&1
+    rv=$(($rv+$?))
+    if [ $rv -ne 0 ]; then
+        warn "Program verification failed. All tools required do not work 
+properly on $HOST. Will still attempt to decode. To fix this warning, try 
+running on another i686 Linux machine"
+    fi
+}
+
+usage () {
+    cat <<EOF
+Usage: `basename $0` [ -h ] [ -r <root_dir> ] [ -p <prog_name> ] [ -c <core_file> ] [ -s <smu_dir> ] [ -b <boardtype> ] [ -i <instance> ] [ -t <platform> ] [ -w <workspace> ] [ -x <script> ] [ -b <bcm_dir> ]
+Prepares gdb for run-time debugging
+
+Options:
+      -h             : display this help and exit
+      -r <root_dir>  : Use <root_dir> as root of source tree. You can
+                       use any pathname that lies within a valid acme
+                       tree; the script will automatically figure out
+                       the root. This option is not required if you run
+                       this program from within a valid acme tree, the
+                       root_dir is then just the root of that acme tree.
+      -s <smu_dir>   : ':'-separated list of paths where SMUs were loaded
+                       Last loaded SMU is at the front of list.
+      -p <prog_name> : Program you wish to debug
+      -c <core_file> : Path to core file
+      -b <boardtype> : Board type, rp, lc or rplc(enxr-spirit). Only valid for xr lineup
+      -i <instance>  : Cisco-instance type (e.g. FRETTA-LC or ZERMATT-RP, etc)
+      -t <platform>  : Platform type, panini, piref or scapa. Only valid for xr lineup
+      -w <workspace> : Line up, possible values "xr" "calvados" "thirdparty"
+      -x <script>    : Execute GDB commands from file <script>
+      -B <bcm_dir>   : BCMSDK buld path - i.e. /auto/panini-projs/fabric/brcm-sdk-6.5.4/tp-r6111-15
+EOF
+    exit 1
+}
+
+#
+# Option processing and variable initialization
+#
+process_options () {
+
+    OPTERR=1
+    while getopts ":p:c:hr:s:b:t:w:x:i:B:" Option
+    do
+	case $Option in
+	p) program=$OPTARG;;
+	r) rootdir=$(find_acme_root $OPTARG); [ $? -ne 0 ] && exit 1;;
+	s) smudir=$OPTARG;;
+	c) corefile=$OPTARG;;
+	b) boardtype_arg=$(set_xr_board_type $OPTARG); [ $? -ne 0 ] && exit 1;;
+	t) platform=$(set_xr_platform_type $OPTARG); [ $? -ne 0 ] && exit 1;;
+	w) treetype=$OPTARG;;
+	x) gdboptions=("${gdboptions[@]}" "-x" "$OPTARG")
+	   # Hack to determine if icore is being executed
+	   if [ -z "$XRNG_GDB_EXE" ] && grep -q /gdbheap.py $OPTARG; then
+	       XRNG_GDB_EXE=/auto/thirdparty-sdk/host-x86_64/bin/gdb-7.11
+	       if [ ! -f /lib64/libexpat.so.0 ]; then
+	           XRNG_GDB_EXE=${XRNG_GDB_EXE}-noexpat
+	       fi
+	   fi
+	   ;;
+	B) bcmpath=$OPTARG;;
+	i) instances=( "${instances[@]}" $OPTARG );;
+	h) usage;;
+	:) echo "*** Option \"-$OPTARG\" needs argument"; echo; usage;;
+	*) echo "*** Invalid option \"-$OPTARG\""; echo; usage;;
+	esac
+    done
+    #
+    # if a rootdir is not specified, check to see if we are already in
+    # some subset of a acme tree
+    #
+    if [ "$rootdir" == "???" ]; then
+	rootdir=$(find_acme_root `pwd`)
+	[ $? -ne 0 ] && error "Missing -r option?"
+    fi
+
+    program=$(find_program $program)
+    [ $? -ne 0 ] && exit 1
+    program=$(readlink -f $program)
+    echo "================"
+    echo "== Executable == $program"
+
+    if [ -f "$corefile" ]; then
+        # Check for compressed cores
+        COMPRESSED_CORE=
+        if head -4c $corefile | od -t x4 | grep -q 184d2204; then
+           COMPRESSED_CORE=/auto/thirdparty-sdk/host-x86_64/bin/lz4
+        elif head -2c $corefile | od -t x2 | grep -q 8b1f; then
+           COMPRESSED_CORE=gzip
+        fi
+        if [ -n "$COMPRESSED_CORE" ]; then
+           corefile_tmp=$(mktemp ${TMPDIR}/$(basename $corefile)-XXXXXX)
+           $COMPRESSED_CORE -dc < $corefile > $corefile_tmp
+           corefile=$corefile_tmp
+        fi
+    fi
+
+    if [ -f "$corefile" -a -z "$instances" ]; then
+        # Try to figure out instance from corefile
+        instances=( $(head -$(echo $(( $(readelf -n $corefile 2>/dev/null | sed -n '/offset.*length/{s/.*\(0x[0-9a-f]*\).*\(0x[0-9a-f]*\).*/\1+\2/p;q}') )) )c $corefile 2>/dev/null | strings | grep /instances/ | sed 's,.*/instances/\([^/]*\).*,\1,' | sort | uniq ) )
+        if [ -n "$instances" ]; then
+            echo "== Instance ==== ${instances[@]}"
+        fi
+    fi
+
+    # Try to locate instance location if running on target
+    if [ -f /etc/thirdparty-release -a -z "$instances" ]; then
+        # Try to figure out instance from /pkg/lib and /opt/cisco/calvados directories
+        instances=( $( ls -ld /pkg/lib/* /opt/cisco/calvados/usr/lib*/* 2>/dev/null | grep instances | sed 's,.*/instances/,,' | cut -f1 -d/ | sort | uniq ) )
+        if [ -n "$instances" ]; then
+            echo "== Instance ==== ${instances[@]}"
+        fi
+    fi
+
+    if [ -n "$instances" ]; then
+      read _ _ buildroot <<< $(grep -h _specdir $rootdir/img-*/*.spec 2>/dev/null | sort -u)
+      buildroot=${buildroot%/*}
+      for inst in "${instances[@]}"; do
+        # Create dirs for link to copy of other instances
+        INSTANCES_DIR=$(grep -h -E "instances/.*instances/${inst}" $rootdir/img-*/*.spec 2>/dev/null)
+	if [ -n "$INSTANCES_DIR" ]; then
+        ( 
+	  cd ${TMPDIR} && \
+	  mkdir -p $( cat <<< "$INSTANCES_DIR" | sed -e 's,/[^/]* [^ ]*$,,' -e 's,.*/instances/,,' | sort -u ) 
+	)
+	# Copy the indirect symbols
+ 	grep -h -E '^cp.*('$(cat <<< "$INSTANCES_DIR" | sed "s,^[^/]*/\([^ ]*\).*,\1," | xargs echo | tr " " "|")')' $rootdir/img-*/*.spec 2>/dev/null | \
+	   sed -e 's,\$RPM_BUILD_ROOT%{pkg_root}/../instances/,'${TMPDIR}'/,g' \
+               -e 's,\.so ,.so.sym ,g' \
+               -e 's,\.so$,.so.sym,g'  \
+               -e 's/^cp /ln -sf /'    \
+               -e "s ${buildroot} ${rootdir} " \
+	    | bash
+        fi
+
+	# Link direct symbols
+        grep -h /instances/${inst} $rootdir/img-*/*.spec 2>/dev/null | \
+	    grep -v '%verify(user group)' | \
+	    grep -v -E "^ln.*instances/$inst.*instances" | \
+	    sed -e 's,\$(CNCOPY_WSROOT),'"$rootdir"',g' \
+	        -e 's,\$RPM_BUILD_ROOT%{pkg_root}/../instances/,'${TMPDIR}'/,g' \
+	        -e 's,\.so ,.so.sym ,g' \
+	        -e 's/^cp /ln -sf /'  \
+	        -e "s ${buildroot} ${rootdir} " \
+	    | bash
+        # Relocate symbolic links when workspace directory is not the same build location.
+        find ${TMPDIR} -name \*.sym | while read f; do
+          F=$(readlink $f)
+          if [ -f "$F" ]; then continue; fi
+          while [ ! -f $rootdir/$F ]; do
+            [ x"$F" != x"${F#*/}" ] || break
+            F=${F#*/}
+          done
+          ln -sf $rootdir/$F $f
+        done
+        find ${TMPDIR} -name \*.sym | while read f; do mv $f ${f%.sym}; done
+      done
+    fi
+
+    #
+    # program is a required argument.
+    # This is needed to determine which gdb to use.
+    # This script now supports ppc, i386 and x86_64
+    #
+    if [ "$program" == "???" ]; then
+	error "Program is a required argument."
+    fi
+    realprog="$program"
+    if [ -h $program ]; then
+        realprog1=$(readlink $program)
+        realprog=`dirname $program`/$realprog1
+    fi
+    file -b -L $program | grep -q x86-64
+    if [ $? -eq 0 ]; then
+        progarch="x86_64"
+    fi
+    file -b -L $program | grep -q "Intel 80386" 
+    if [ $? -eq 0 ]; then
+        progarch="i686"
+	lib64=""
+    fi
+#    file -b -L $program | grep -q elf32
+#    if [ $? -eq 0 ]; then
+#        progarch="ppc"
+#	lib64=""
+#    fi
+    file -b -L $program | grep -q ARM
+    if [ $? -eq 0 ]; then
+        progarch="arm"
+        lib64=""
+    fi
+    nm $realprog | grep x86_64_start_kernel > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        use_crash_tool=true;
+    fi
+}
+
+gdb_version_check() {
+
+    PRELOAD_PATH=""
+    # Are we running this on router?
+    if [ -f /etc/thirdparty-release ]; then
+      GDB=gdb # /usr/bin/gdb
+    else
+      # Do we have access to thirdparty gdb
+      if [ -x "$XRNG_GDB_EXE" ]; then
+        GDB=$XRNG_GDB_EXE
+      elif [ -x /auto/thirdparty-sdk/host-x86_64/bin/gdb-7.11-X ]; then
+        GDB=/auto/thirdparty-sdk/host-x86_64/bin/gdb-7.11
+        if [ ! -f /lib64/libexpat.so.0 ]; then
+          GDB=${GDB}-noexpat
+        fi
+      elif [ -x /router/bin/gdb-7.8.2 ] && grep -q "GNU C 4.7.0" "$program" 2>/dev/null ; then
+        GDB=/router/bin/gdb-7.8.2
+      elif [ -f /router/bin/gdb ]; then
+        GDB=/router/bin/gdb
+      elif [ -f /router/bin/gdb-7.2.2 ]; then
+        GDB=/router/bin/gdb-7.2.2
+      else 
+        if [ -f ${1}/usr/bin/gdb ]; then
+          PRELOAD_PATH="${1}/lib64/ld-linux-x86-64.so.2 --library-path ${1}/lib64:${1}/usr/lib64 "
+          GDB=${1}/usr/bin/gdb
+        else
+          # Default to some gdb
+          GDB=gdb
+        fi
+      fi
+      if [ ! -d $(strings $(which $GDB 2>&1) | grep '/sw/packages/python/[0-9.]*$') ]; then
+         export PYTHONHOME=/sw/packages/python/current
+      fi
+      if ${PRELOAD_PATH} $GDB --version | grep "GNU gdb" | tr -dc -- "- 0-9." | tr ".-" "  " | ( read a b c ; a=${a:-0}; b=${b:-0}; [ $a -gt 7 ] || [ $a -eq 7 -a $b -ge 6 ] ); then
+         GDB_EXTRA_CMD="set auto-load safe-path /"
+      fi
+    fi
+    if [ ! -d $(strings $(which $GDB 2>&1) | grep '/sw/packages/python/[0-9.]*$') ]; then
+       export PYTHONHOME=/sw/packages/python/current
+    fi
+    #GDB=router/bin/gdb-7.2-64 #Test only
+    #PRELOAD_PATH="" # Test only
+    SETROOT=0
+    version=$(${PRELOAD_PATH} $GDB --version | grep 'GNU gdb' | awk '{ print $4 }')
+    if [[ "$version" > "7.0" ]]; then
+        SETROOT=1
+    fi
+}
+
+process_options "$@"
+
+if [ ! -z "${corefile}" ] ;then
+  if [ -f "${corefile}" ] ; then
+    CORECMD="core-file ${corefile}"
+  fi
+  if [ ! "${boardtype_arg}" ] ; then
+    if [ -f "${corefile}" ] ; then
+      check_boardtype=$(echo $corefile|egrep -i "_RP[0-9]_CPU");
+      if [ -n "${check_boardtype}" ]; then
+        boardtype="rp"
+      else
+        boardtype="lc"
+      fi
+    fi
+  else
+    boardtype="${boardtype_arg}"
+  fi
+else
+  boardtype="${boardtype_arg}"
+
+  #live gdb on router:
+  if [ -f /etc/thirdparty-release ]; then
+    check_boardtype=$(cat /proc/cmdline|egrep -i "boardtype=RP")
+    if [ -n "${check_boardtype}" ]
+    then
+      boardtype="rp"
+    else
+      boardtype="lc"
+    fi
+  fi
+fi
+
+if [ "$treetype" != "???" ]; then
+    if [ "$treetype" != "xr" -a "$treetype" != "calvados" -a "$treetype" != "thirdparty" ]; then
+        error "Invalid line up specifed possible values 'xr' 'calvados' 'thirdparty' "
+    fi
+fi
+if [ "$treetype" == "???" ]; then
+    treetype=$(find_tree_type ${rootdir} ${program})
+fi
+if [ "${treetype}" == "thirdparty" ] ;then
+  SYSROOT="$rootdir/kvm-host-stage/x86_64"
+  SOLIBPATH="$rootdir/kvm-host-stage/x86_64/lib$lib64:$rootdir/kvm-host-stage/x86_64/usr/lib$lib64"
+  #NO SMULIBPATH
+else
+  if [ "${treetype}" == "xr" ]; then
+    readjust_xr_platform_type
+    adjust_bcmpath
+    if [ "${platform}" == "enxr-spirit" ]; then
+      SYSROOT="$rootdir/thirdparty/opensource/sdk/enxr/x86_64"
+      SOLIBPATH="$rootdir/tgt-linux/pkg-${boardtype}-64-spirit/lib/:$rootdir/tgt-linux/pkg-${boardtype}-64-spirit/lib/stubs/"
+    elif [ "${platform}" == "spitfire" ]; then
+      SYSROOT="$rootdir/xr-deps/sysroots/WR9/x86_64"
+      SOLIBPATH="$rootdir/make-thinxr-ljam/staging/t3n3phjg/pkg/lib:$rootdir/make-thinxr-ljam/staging/m1TJ8vhX/lib64:$rootdir/xr-deps/sysroots/WR9/x86_64/usr/lib64:$rootdir/xr-deps/sysroots/CPA/x86_64/usr/lib64/leaba/lib:$rootdir/xr-deps/sysroots/CPA/x86_64/usr/lib64"
+    else
+      SYSROOT="$rootdir/thirdparty/opensource/sdk/x86_64"
+      SOLIBPATH="$rootdir/img-${platform}/lib/${boardtype}/obj-x86_64-linux${spirit}:$rootdir/thirdparty/opensource/sdk/x86_64/lib$lib64:$rootdir/thirdparty/opensource/sdk/x86_64/usr/lib$lib64:$rootdir/calvados/sdk/x86_64/opt/cisco/calvados/usr/lib64${bcmpath:+:}$bcmpath"
+    fi
+    if [ -n "$instances" ]; then
+      for inst in "${instances[@]}"; do
+        SOLIBPATH=${TMPDIR}/${inst}/lib:$SOLIBPATH
+      done
+    fi
+    if [ "$smudir" != "???" ]; then
+      setup_smulib_path ${smudir} ${boardtype} ${spirit}
+      if [ -f "$corefile" ]; then
+	  sanitize_smulib_path $corefile ${smudir}
+      fi
+    fi
+  else
+    SYSROOT="$rootdir/os-infra-sdk/$progarch/"
+    SOLIBPATH="$rootdir/os-infra-sdk/$progarch/lib$lib64:$rootdir/os-infra-sdk/$progarch/usr/lib$lib64:$rootdir/kvm-calvados-stage/$progarch/opt/cisco/calvados/usr/lib$lib64:$rootdir/fabric-sdk/$progarch/usr/lib$lib64:${SYSROOT}/opt/confd/lib"
+    if [ "$smudir" != "???" ]; then
+      setup_smulib_path_calvados ${smudir}
+    fi
+  fi
+fi
+echo "================"
+
+if [ "$use_crash_tool" == "???" ]; then
+
+gdb_version_check ${SYSROOT}
+
+if [ -n "$rootdir" ]; then
+  GDB_EXTRA_CMD="$GDB_EXTRA_CMD
+dir $rootdir"
+fi
+
+if [ "${SETROOT}" == "1" ]; then
+echo "Set-ed ROOT $SYSROOT $SOLIBPATH"
+cat <<EOF > /${TMPDIR}/xrng_gdb.script
+set auto-solib-add on
+set sysroot ${SYSROOT}
+set solib-search-path ${SMULIBPATH}${SOLIBPATH}
+${GDB_EXTRA_CMD}
+file $program
+${CORECMD}
+EOF
+else 
+echo "Set-ed ROOT $SYSROOT $SOLIBPATH"
+cat <<EOF > /${TMPDIR}/xrng_gdb.script
+set auto-solib-add on
+set solib-absolute-prefix /dev/null
+set solib-search-path ${SMULIBPATH}${SOLIBPATH}
+${GDB_EXTRA_CMD}
+file $program
+${CORECMD}
+EOF
+fi
+
+${PRELOAD_PATH} $GDB $batch --command /${TMPDIR}/xrng_gdb.script "${gdboptions[@]}"
+else # use_crash_tool
+function tp_have_fix {
+  if [ -e ${SYSROOT}/etc/thirdparty-release -a ! -f /dev/fd/105 ] ; then
+    [ -x /usr/cisco/bin/pims ] || return 1
+    TMPFILE=$(mktemp)
+    ! /usr/cisco/bin/pims dial query -l $(grep "Devline  " ${SYSROOT}/etc/thirdparty-release | cut -f2 -d:) > $TMPFILE && rm $TMPFILE && return 1
+    exec 105<> $TMPFILE
+    rm $TMPFILE
+  fi
+  if [ -f /dev/fd/105 ] ; then
+    exec 104<&105
+  fi
+  if [ -f /dev/fd/104 ]; then
+    grep -q "$1" < /dev/fd/104
+    ret=$?
+    exec 104>&-
+    return $ret
+  fi
+}
+  [ -z "$CRASH_IOHOLE" ] && tp_have_fix CSCul92596 && CRASH_IOHOLE=0x30000000
+
+  KERNVER=$(readlink ${SYSROOT}/boot/bzImage | cut -f2- -d-)
+
+  if [ -z "$CRASH" ]; then
+    PRELOAD_PATH="${SYSROOT}/lib64/ld-linux-x86-64.so.2 --library-path ${SYSROOT}/lib64:${SYSROOT}/usr/lib64 "
+    CRASH="${PRELOAD_PATH}${SYSROOT}/usr/bin/crash"
+    CRASH_EXTENSIONS=${SYSROOT}/usr/lib64/crash/extensions
+
+    # Override target's "crash" executable if
+    # - 3.10 kernel and target is using crash 6.0.9
+    # - I/O hole at 768M (CSCul92596) but missing crash support (!CSCun37325)
+    if [ "$KERNVER" = "3.10.19" -a \
+	 "$(${CRASH} -v | grep crash)" = "crash 6.0.9" ] ||  \
+       ( [ -n "$CRASH_IOHOLE" -a -x /auto/thirdparty-sdk/host-x86_64/bin/crash ] && ! tp_have_fix CSCun37325 ) ; then
+      CRASH=/auto/thirdparty-sdk/host-x86_64/bin/crash
+      CRASH_EXTENSIONS=/auto/thirdparty-sdk/host-x86_64/lib/crash/extensions
+    fi
+  fi
+
+  if [ -z "$TRACE_CMD" ]; then
+    if [ -x "${SYSROOT}/usr/bin/trace-cmd" ]; then
+      TRACE_CMD="${PRELOAD_PATH}${SYSROOT}/usr/bin/trace-cmd"
+    else
+      TRACE_CMD=/auto/thirdparty-sdk/host-x86_64/bin/trace-cmd
+    fi
+  fi
+
+  [ -n "$CRASH_IOHOLE" ] && CRASH_IOHOLE="--kvmio=${CRASH_IOHOLE}"
+
+  exec 105>&-
+  if [ "${#gdboptions[@]}" -gt 0 ]; then
+      # Remove temporary file as soon as possible while keeping 
+      # fd open for later access
+      TMPFILE=$(mktemp)
+      exec 108<>$TMPFILE
+      rm $TMPFILE
+      for i in $(seq 1 2 "${#gdboptions[@]}"); do [ -e "${gdboptions[$i]}" ] && cat "${gdboptions[$i]}" >> /proc/self/fd/108; done
+      gdboptions=( -i /dev/fd/108 )
+  fi 
+  CRASH_MODULE_PATH=${SYSROOT}/lib/modules/${KERNVER}
+  if [ ! -d $CRASH_MODULE_PATH ]; then
+    CRASH_MODULE_PATH=${SYSROOT}/lib/modules/$(strings $program | grep -E '^Linux version [0-9]' | head -1 | cut -f3 -d\ )
+  fi
+  export CRASH_MODULE_PATH CRASH_EXTENSIONS TRACE_CMD
+  $CRASH $CRASH_IOHOLE "${gdboptions[@]}" $program ${corefile} 
+fi
