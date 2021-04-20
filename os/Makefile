@@ -28,8 +28,8 @@ jkernel.iso: jkernel.bin
 		echo '    boot' >> iso/boot/grub/grub.cfg
 		echo '}' >> iso/boot/grub/grub.cfg
 		# mkisofs -R -b boot/grub/stage2_eltorito -no-emul-boot -boot-load-size 4 -boot-info-table -quiet -o $@ "$IMAGE_DIR/"
-		mkisofs -o $@ "iso/"
-		# grub-mkrescue --output=$@ iso
+		# mkisofs -o $@ "iso/"
+		grub-mkrescue --output=$@ iso
 
 clean:
 	rm -rf *.o *.bin *.iso iso/
