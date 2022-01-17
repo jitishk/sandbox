@@ -1,10 +1,13 @@
+.ONESHELL: # Executes as one shell. (So, cd will change directory)
 
 GPPPARAMS = -m32 -fno-use-cxa-atexit -nostdlib -fno-builtin -fno-rtti -fno-exceptions -fno-leading-underscore
 ASPARAMS = --32
 LDPARAMS = -melf_i386
 
-objects = loader.o kernel.o
+objects = loader.o gdt.o kernel.o
 
+# $@ means target file
+# $< means input file
 %.o: %.cpp
 	g++ $(GPPPARAMS) -o $@ -c $<
 
@@ -12,14 +15,19 @@ objects = loader.o kernel.o
 	as $(ASPARAMS) -o $@ $<
 
 jkernel.bin: linker.ld $(objects)
-	ld $(LDPARAMS) -T $< -o $@ $(objects)
+	mkdir -p build/
+	ld $(LDPARAMS) -T $< -o build/$@ $(objects)
 
 install: jkernel.bin
 	sudo cp $< /boot/jkernel.bin
 
+copy: jkernel.iso
+	sudo -S jitish cp $< /media/sf_VBoxSharedFolder/
+
 jkernel.iso: jkernel.bin
-		mkdir -p iso/boot/grub
-		cp $< iso/boot/
+		mkdir -p image/iso/boot/grub
+		cd image
+		cp ../build/$< iso/boot/
 		echo 'set timeout=0' >> iso/boot/grub/grub.cfg
 		echo 'set default=0' >> iso/boot/grub/grub.cfg
 		echo '' >> iso/boot/grub/grub.cfg
@@ -32,6 +40,6 @@ jkernel.iso: jkernel.bin
 		grub-mkrescue --output=$@ iso
 
 clean:
-	rm -rf *.o *.bin *.iso iso/
+	rm -rf *.o *.bin *.iso iso/ image/*
 
 
