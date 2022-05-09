@@ -4,14 +4,15 @@ GPPPARAMS = -m32 -fno-use-cxa-atexit -nostdlib -fno-builtin -fno-rtti -fno-excep
 ASPARAMS = --32
 LDPARAMS = -melf_i386
 
-objects = loader.o gdt.o kernel.o
+objects = loader.o gdt.o kernel.o port.o  # interruptstubs.o interrupts.o kernel.o
 
 # $@ means target file
 # $< means input file
+
 %.o: %.cpp
 	g++ $(GPPPARAMS) -o $@ -c $<
 
-%.o: *.s
+%.o: %.s
 	as $(ASPARAMS) -o $@ $<
 
 jkernel.bin: linker.ld $(objects)
@@ -39,7 +40,7 @@ jkernel.iso: jkernel.bin
 		# mkisofs -o $@ "iso/"
 		grub-mkrescue --output=$@ iso
 
+.PHONY: clean
+
 clean:
 	rm -rf *.o *.bin *.iso iso/ image/*
-
-
